@@ -148,6 +148,194 @@ class FEFPopulation(NeuralPopulation):
         self.rate[t, :, trial] = drive * self.gain[:, trial]
 
 
+class FEFPopulation(NeuralPopulation):
+    """
+    Common FEF population.
+
+    Shared parameters and interface for linear and nonlinear
+    FEF implementations.
+    """
+
+    def __init__(self, config, rng):
+        super().__init__(
+            config.n_neurons_fef,
+            config.n_trials,
+            config.T,
+            config.dt,
+            rng,
+        )
+
+        self.config = config
+        self.rng = rng
+
+        self.ch_pref = -1 + 2 * rng.integers(
+            0, 2, self.n_neurons
+        )
+        self.mt_pref = -1 + 2 * rng.integers(
+            0, 2, self.n_neurons
+        )
+
+        gains = gamma.rvs(
+            a=1.0 / config.var_gain,
+            scale=config.var_gain,
+            size=(self.n_neurons, self.n_trials),
+            random_state=rng,
+        )
+        self.gain = np.minimum(4.0, gains)
+
+        self.mt_evidence = 60.0 * norm.cdf(
+            config.time,
+            loc=3 * 0.075,
+            scale=0.075,
+        )
+
+        self.amplitude_mt = lognorm.rvs(
+            s=0.5,
+            scale=np.exp(2.5),
+            size=self.n_neurons,
+            random_state=rng,
+        )
+
+        self.epsilon = lognorm.rvs(
+            s=0.25,
+            scale=np.exp(3.25),
+            size=self.n_neurons,
+            random_state=rng,
+        )
+
+        self.w_ch = lognorm.rvs(
+            s=0.5,
+            scale=np.exp(-2.0),
+            size=self.n_neurons,
+            random_state=rng,
+        )
+
+        self.w_mt = lognorm.rvs(
+            s=0.5,
+            scale=np.exp(0.0),
+            size=self.n_neurons,
+            random_state=rng,
+        )
+
+        self.ch_decay = config.ch_decay_fef
+        self.threshold = config.threshold_fef
+
+    def compute_rate(self, trial, t):
+        raise NotImplementedError(
+            "Use set_rate_from_dvs() with the current categorical "
+            "and motor decision variables."
+        )
+
+    def set_rate_from_dvs(
+        self,
+        trial,
+        t,
+        categorical_dv,
+        motor_dv,
+    ):
+        """
+        Implemented separately by LinearFEFPopulation
+        and NonlinearFEFPopulation.
+        """
+        raise NotImplementedError
+
+
+class LinearFEFPopulation(FEFPopulation):
+    """FEF population with linear categorical and motor inputs."""
+
+    def set_rate_from_dvs(self, trial, t, categorical_dv, motor_dv):
+        drive = np.maximum(
+            0.0,
+            self.w_ch * self.ch_pref * categorical_dv
+            + self.w_mt * motor_dv
+            + self.epsilon
+        )
+        self.rate[t, :, trial] = drive * self.gain[:, trial]
+
+
+class NonlinearFEFPopulation(FEFPopulation):
+    """
+    FEF population with nonlinear categorical tuning
+    and the same motor-related contribution.
+    """
+
+    def __init__(self, config, rng):
+        super().__init__(config, rng)
+
+        # DV grid
+        self.x_grid = np.arange(
+            -1.0,
+            1.0 + 0.01 / 2,
+            0.01,
+        )
+
+        # Use the same categorical preference as the linear model.
+        self.dv_pref = self.ch_pref.astype(float)
+
+        # Mean tuning curves
+        mu = (
+            20.0
+            + 15.0
+            * self.dv_pref[:, None]
+            * self.x_grid[None, :]
+        )
+
+        # Squared-exponential covariance kernel
+        sigma_f = 0.4
+        sigma_l = 0.25
+
+        diff = (
+            self.x_grid[:, None]
+            - self.x_grid[None, :]
+        )
+
+        K = sigma_f**2 * np.exp(
+            -(diff**2) / (2.0 * sigma_l**2)
+        )
+
+        # Numerical stabilization
+        K += 1e-8 * np.eye(len(self.x_grid))
+
+        # Smooth random functions in log-rate space
+        self.log_tuning = np.stack([
+            rng.multivariate_normal(
+                mean=np.log(mu[i]),
+                cov=K,
+            )
+            for i in range(self.n_neurons)
+        ])
+
+        # Final nonlinear tuning curves
+        self.nonlinear_tuning = np.exp(self.log_tuning)
+
+    def set_rate_from_dvs(
+        self,
+        trial,
+        t,
+        categorical_dv,
+        motor_dv,
+    ):
+        # Find nearest categorical DV grid point
+        idx = np.argmin(
+            np.abs(self.x_grid - categorical_dv)
+        )
+
+        # Nonlinear categorical response
+        categorical_drive = self.nonlinear_tuning[:, idx]
+
+        # Preserve the motor-related response
+        motor_drive = self.w_mt * motor_dv
+
+        drive = np.maximum(
+            0.0,
+            categorical_drive + motor_drive,
+        )
+
+        self.rate[t, :, trial] = (
+            drive * self.gain[:, trial]
+        )
+
+
 class SCPopulation(NeuralPopulation):
     def __init__(self, config, rng):
         super().__init__(
